@@ -18,6 +18,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import winreg
 from pathlib import Path
 
 try:
@@ -325,12 +326,33 @@ def generate_hardware() -> None:
         "Select-Object Name, DriverVersion, AdapterRAM, VideoProcessor"
     )
     if gpus:
+        # Read true VRAM from registry (64-bit qwMemorySize, no uint32 cap).
+        # Registry subkey order does NOT match WMI order, so match by name.
+        _gpu_reg_base = (
+            r"SYSTEM\ControlSet001\Control\Class"
+            r"\{4d36e968-e325-11ce-bfc1-08002be10318}"
+        )
+        registry_vram: dict[str, int] = {}
+        for idx in range(16):  # scan up to 16 subkeys
+            subkey = rf"{_gpu_reg_base}\{idx:04d}"
+            try:
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, subkey) as key:
+                    desc, _ = winreg.QueryValueEx(key, "DriverDesc")
+                    val, _ = winreg.QueryValueEx(
+                        key, "HardwareInformation.qwMemorySize"
+                    )
+                    registry_vram[desc] = int(val)
+            except OSError:
+                continue
+
         w("| GPU | Driver | VRAM | Processor |")
         w("|-----|--------|------|-----------|")
         for g in gpus:
             name = g.get("Name", "N/A")
             driver = g.get("DriverVersion", "N/A")
-            vram = format_bytes(g.get("AdapterRAM", 0))
+            # Prefer registry (accurate 64-bit) over WMI (uint32, caps at ~4 GB).
+            raw_vram = registry_vram.get(name, 0) or g.get("AdapterRAM", 0)
+            vram = format_bytes(raw_vram)
             proc = g.get("VideoProcessor", "N/A") or "N/A"
             w(f"| {name} | {driver} | {vram} | {proc} |")
     else:
