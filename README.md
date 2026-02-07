@@ -50,6 +50,26 @@ pip install psutil
 python Windows-Inventory.py
 ```
 
+### macOS (Apple Silicon & Intel)
+
+**Prerequis :** Python 3.14+, psutil
+
+Lancez le script d'installation automatique :
+
+```bash
+chmod +x MacOS-Inventory.RUN.sh
+./MacOS-Inventory.RUN.sh
+```
+
+Ou lancez manuellement :
+
+```bash
+pip install psutil
+python3 MacOS-Inventory.py
+```
+
+> **Note :** Certaines sections (ports en ecoute, logs systeme) donnent plus d'informations avec `sudo`.
+
 ---
 
 ## Ce qui est collecte
@@ -67,6 +87,8 @@ python Windows-Inventory.py
 - Peripheriques audio
 - Details SMART des disques (Linux)
 - Inventaire firmware via fwupd (Linux)
+- Details Apple Silicon : coeurs P/E, Neural Engine, Rosetta 2 (macOS)
+- Peripheriques Thunderbolt et Bluetooth (macOS)
 
 </details>
 
@@ -76,9 +98,9 @@ python Windows-Inventory.py
 - Version OS, build, architecture, date d'installation
 - Locale et fuseau horaire
 - Versions logicielles (Python, Node.js, Go, Git, Docker, Nginx, PostgreSQL, Redis...)
-- Tous les programmes installes avec version et editeur (registre Windows / pacman)
+- Tous les programmes installes avec version et editeur (registre Windows / pacman / Homebrew+Applications macOS)
 - Services actives et en demarrage automatique
-- Taches planifiees / cron jobs / timers systemd
+- Taches planifiees / cron jobs / timers systemd / LaunchDaemons+Agents macOS
 - Images, volumes et reseaux Docker
 - Utilisateurs locaux
 - Ports en ecoute
@@ -103,6 +125,9 @@ python Windows-Inventory.py
 - Evenements systeme recents / logs
 - Mises a jour en attente (Linux)
 - Temperatures et ventilateurs (Linux, avec lm-sensors)
+- Etat securite : SIP, Gatekeeper, FileVault, Firewall (macOS)
+- Pression memoire et infos Wi-Fi (macOS)
+- Mises a jour macOS en attente (macOS)
 
 </details>
 
@@ -115,6 +140,8 @@ Les scripts detectent les outils disponibles et s'adaptent. Rien ne casse si un 
 **Windows :** PowerShell, Docker, Git, WSL, Node.js, Go, psql, mysql, redis-server, nginx, VS Code
 
 **Linux :** `smartctl`, `nvme`, `sensors`, `dmidecode`, `lshw`, `fwupdmgr`, `hostnamectl`, `timedatectl`, `localectl`, `expac`, `checkupdates`
+
+**macOS :** `brew`, `mas`, Docker, Git, Node.js, Go, psql, mysql, redis-server, nginx, Tmux, VS Code, Xcode CLT
 
 ---
 
