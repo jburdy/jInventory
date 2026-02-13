@@ -4,10 +4,11 @@
 Windows 11 System Inventory Script
 Port of Linux-Inventory.sh for Windows 11 using Python 3.14+
 
-Generates 3 Markdown reports:
+Generates 4 Markdown reports:
   1. hardware.md   - static hardware info
   2. software.md   - installed software & versions
   3. state.md      - live runtime state (CPU, RAM, disk usage, processes...)
+  4. diskspace.md  - disk space usage by category (images, documents, programs, games...)
 """
 
 import datetime
@@ -37,18 +38,12 @@ HOSTNAME = socket.gethostname()
 HW_FILE = SCRIPT_DIR / f"jInventory-{HOSTNAME}-0-hardware.md"
 SW_FILE = SCRIPT_DIR / f"jInventory-{HOSTNAME}-1-software.md"
 ST_FILE = SCRIPT_DIR / f"jInventory-{HOSTNAME}-2-state.md"
+DS_FILE = SCRIPT_DIR / f"jInventory-{HOSTNAME}-3-diskspace.md"
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def sanitize(text: str) -> str:
-    """Strip ANSI escape codes, null bytes, and non-ASCII characters."""
-    text = re.sub(r"\x1b\[[0-9;]*m", "", text)
-    text = text.replace("\x00", "")  # strip null bytes (UTF-16 artifacts)
-    return text.encode("ascii", errors="ignore").decode("ascii")
-
-
 def run_ps(command: str, *, timeout: int = 30) -> str:
     """Run a PowerShell command and return stdout."""
     try:
@@ -120,37 +115,66 @@ def format_bytes(n: int | float) -> str:
     return f"{n:.1f} PB"
 
 
-def format_bytes_gib(n: int | float) -> str:
-    """Format bytes to GiB."""
-    return f"{n / (1024**3):.1f} GiB"
+# -- File-type categories (keep in sync with MacOS / Linux scripts) --
+_CATEGORIES: dict[str, set[str]] = {
+    "Images": {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp",
+               ".svg", ".ico", ".heic", ".heif", ".raw", ".cr2", ".nef", ".psd",
+               ".avif", ".eps", ".jp2"},
+    "Videos": {".mp4", ".avi", ".mkv", ".mov", ".wmv", ".flv", ".webm", ".m4v",
+               ".3gp", ".mts", ".m2ts", ".mpg", ".mpeg", ".vob", ".ogv", ".ts",
+               ".3g2"},
+    "Audio": {".mp3", ".wav", ".flac", ".aac", ".ogg", ".wma", ".m4a", ".opus",
+              ".aiff", ".mid", ".midi", ".alac", ".ape"},
+    "Documents": {".pdf", ".doc", ".docx", ".txt", ".rtf", ".odt", ".xls", ".xlsx",
+                  ".ppt", ".pptx", ".ods", ".odp", ".csv", ".epub", ".md", ".tex",
+                  ".pages", ".numbers", ".key"},
+    "Emails": {".eml", ".msg"},
+    "Archives": {".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".zst"},
+    "Code_Source": {".py", ".js", ".ts", ".jsx", ".tsx", ".html", ".css", ".scss",
+                    ".cpp", ".c", ".h", ".hpp", ".java", ".php", ".rb", ".go",
+                    ".rs", ".swift", ".kt", ".sh", ".bat", ".ps1", ".json", ".xml",
+                    ".yaml", ".yml", ".toml", ".sql", ".lua", ".pl", ".dart",
+                    ".vue", ".cs"},
+    "Executables": {".exe", ".dll", ".sys", ".so", ".dylib", ".bin", ".com"},
+    "Installers": {".msi", ".iso", ".dmg", ".img", ".cab", ".pkg", ".deb", ".rpm",
+                   ".appimage", ".snap", ".flatpak"},
+    "VM_Disks": {".vdi", ".vmdk", ".vhd", ".vhdx", ".qcow", ".qcow2", ".ova",
+                 ".ovf"},
+    "Fonts": {".ttf", ".otf", ".woff", ".woff2", ".eot"},
+}
+_EXT_TO_CAT: dict[str, str] = {
+    ext: cat for cat, exts in _CATEGORIES.items() for ext in exts
+}
 
 
-# ---------------------------------------------------------------------------
-# Tool detection
-# ---------------------------------------------------------------------------
-TOOLS_TO_CHECK = [
-    "git",
-    "python",
-    "node",
-    "npm",
-    "docker",
-    "go",
-    "psql",
-    "mysql",
-    "redis-server",
-    "nginx",
-    "code",
-    "wsl",
-]
+def _scan_file_categories(root: Path, max_files: int = 200_000) -> tuple[dict[str, list[int]], int]:
+    """Walk *root* and collect {category: [count, total_bytes]}.
 
-print("Tool detection:")
-AVAILABLE_TOOLS: dict[str, bool] = {}
-for tool in TOOLS_TO_CHECK:
-    found = which(tool)
-    AVAILABLE_TOOLS[tool] = found
-    status = "[OK]     " if found else "[MISSING]"
-    print(f"  {status} {tool}")
-print()
+    Stops after *max_files* to keep runtime reasonable on large drives.
+    Returns (stats_dict, files_scanned).
+    """
+    stats: dict[str, list[int]] = {}
+    scanned = 0
+    try:
+        for entry in root.rglob("*"):
+            if scanned >= max_files:
+                break
+            try:
+                if entry.is_file():
+                    ext = entry.suffix.lower() if entry.suffix else ""
+                    cat = _EXT_TO_CAT.get(ext, "Other")
+                    size = entry.stat().st_size
+                    if cat in stats:
+                        stats[cat][0] += 1
+                        stats[cat][1] += size
+                    else:
+                        stats[cat] = [1, size]
+                    scanned += 1
+            except (OSError, PermissionError):
+                continue
+    except (OSError, PermissionError):
+        pass
+    return stats, scanned
 
 
 # ============================================================
@@ -228,7 +252,7 @@ def generate_hardware() -> None:
     w("## Memory (hardware)")
     w("")
     mem = psutil.virtual_memory()
-    w(f"- **Total installed**: {format_bytes_gib(mem.total)}")
+    w(f"- **Total installed**: {format_bytes(mem.total)}")
     w("")
 
     ram_modules = ps_json("Get-CimInstance Win32_PhysicalMemory")
@@ -748,16 +772,6 @@ def generate_state() -> None:
     w("")
     w("| PID | Name | CPU% | Mem% | Memory |")
     w("|-----|------|------|------|--------|")
-    procs = []
-    for p in psutil.process_iter(
-        ["pid", "name", "cpu_percent", "memory_percent", "memory_info"]
-    ):
-        try:
-            info = p.info
-            procs.append(info)
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
-    # Let CPU measurement settle
     procs_cpu = []
     for p in psutil.process_iter(
         ["pid", "name", "cpu_percent", "memory_percent", "memory_info"]
@@ -937,6 +951,291 @@ def generate_state() -> None:
 
 
 # ============================================================
+# 4. DISK SPACE REPORT (usage by category)
+# ============================================================
+def generate_disk_space() -> None:
+    lines: list[str] = []
+    w = lines.append
+
+    w(f"# Disk Space Usage Analysis - {HOSTNAME}")
+    w("")
+    w(f"> Generated: {TIMESTAMP}")
+    w("")
+
+    # --- Overall Disk Usage Summary ---
+    w("## Overall Disk Usage Summary")
+    w("")
+    w("| Drive | Total | Used | Free | Usage % |")
+    w("|-------|-------|------|------|---------|")
+    
+    total_system_usage = 0
+    for part in psutil.disk_partitions():
+        try:
+            usage = psutil.disk_usage(part.mountpoint)
+            total_system_usage += usage.used
+            pct = f"{usage.percent:.1f}%"
+            w(
+                f"| {part.mountpoint} | {format_bytes(usage.total)} | "
+                f"{format_bytes(usage.used)} | {format_bytes(usage.free)} | {pct} |"
+            )
+        except (PermissionError, OSError):
+            pass
+    w("")
+    w(f"**Total system storage used**: {format_bytes(total_system_usage)}")
+    w("")
+
+    # -- Scan all drives once, reuse for global + per-drive --
+    drive_results: dict[str, tuple[dict[str, list[int]], int]] = {}
+    for part in psutil.disk_partitions():
+        try:
+            psutil.disk_usage(part.mountpoint)
+        except (PermissionError, OSError):
+            continue
+        drive_results[part.mountpoint] = _scan_file_categories(Path(part.mountpoint))
+
+    # --- File Categories (all drives combined) ---
+    w("## File Categories (all drives)")
+    w("")
+
+    global_stats: dict[str, list[int]] = {}
+    global_scanned = 0
+    for stats, scanned in drive_results.values():
+        global_scanned += scanned
+        for cat, (cnt, tot) in stats.items():
+            if cat in global_stats:
+                global_stats[cat][0] += cnt
+                global_stats[cat][1] += tot
+            else:
+                global_stats[cat] = [cnt, tot]
+
+    if global_stats:
+        truncated = " (truncated on some drives)" if global_scanned >= 200_000 else ""
+        w(f"*Scanned {global_scanned:,} files{truncated}*")
+        w("")
+        by_size = sorted(global_stats.items(), key=lambda x: x[1][1], reverse=True)
+        w("| Category | Count | Total Size |")
+        w("|----------|-------|------------|")
+        for cat, (count, total_size) in by_size:
+            w(f"| {cat} | {count:,} | {format_bytes(total_size)} |")
+        w("")
+    else:
+        w("(no files found)")
+        w("")
+
+    # --- File Categories per Drive ---
+    w("## File Categories per Drive")
+    w("")
+
+    for mountpoint, (stats, scanned) in drive_results.items():
+        w(f"### Drive {mountpoint}")
+        w("")
+
+        if not stats:
+            w("(no files found or access denied)")
+            w("")
+            continue
+
+        truncated = " (truncated)" if scanned >= 200_000 else ""
+        w(f"*Scanned {scanned:,} files{truncated}*")
+        w("")
+
+        by_size = sorted(stats.items(), key=lambda x: x[1][1], reverse=True)
+        w("| Category | Count | Total Size |")
+        w("|----------|-------|------------|")
+        for cat, (count, total_size) in by_size:
+            w(f"| {cat} | {count:,} | {format_bytes(total_size)} |")
+        w("")
+
+    # --- Analyze User Directories ---
+    w("## User Directory Analysis")
+    w("")
+    
+    # Get all user profiles
+    user_profiles = []
+    users_dir = Path("C:/Users")
+    if users_dir.exists():
+        for item in users_dir.iterdir():
+            if item.is_dir() and not item.name.startswith('.') and item.name not in ['All Users', 'Default', 'Default User', 'Public']:
+                user_profiles.append(item)
+    
+    if not user_profiles:
+        w("No user profiles found for analysis.")
+    else:
+        w(f"Found {len(user_profiles)} user profiles to analyze...")
+        w("")
+        
+        for user_dir in user_profiles:
+            w(f"### User: {user_dir.name}")
+            w("")
+            
+            # Analyze main user directories
+            dirs_to_analyze = [
+                ("Desktop", user_dir / "Desktop"),
+                ("Documents", user_dir / "Documents"),
+                ("Downloads", user_dir / "Downloads"),
+                ("Pictures", user_dir / "Pictures"),
+                ("Videos", user_dir / "Videos"),
+                ("Music", user_dir / "Music"),
+                ("AppData/Local", user_dir / "AppData" / "Local"),
+                ("AppData/Roaming", user_dir / "AppData" / "Roaming")
+            ]
+            
+            user_total = 0
+            for dir_name, dir_path in dirs_to_analyze:
+                if dir_path.exists():
+                    try:
+                        dir_size = sum(f.stat().st_size for f in dir_path.rglob('*') if f.is_file())
+                        user_total += dir_size
+                        w(f"- **{dir_name}**: {format_bytes(dir_size)}")
+                    except (OSError, PermissionError):
+                        w(f"- **{dir_name}**: (Access denied)")
+            
+            w(f"**Total for {user_dir.name}**: {format_bytes(user_total)}")
+            w("")
+
+    # --- Program Files Analysis ---
+    w("## Program Files Analysis")
+    w("")
+    
+    program_dirs = [
+        ("Program Files", Path("C:/Program Files")),
+        ("Program Files (x86)", Path("C:/Program Files (x86)")),
+        ("ProgramData", Path("C:/ProgramData"))
+    ]
+    
+    for dir_name, dir_path in program_dirs:
+        if dir_path.exists():
+            try:
+                total_size = 0
+                large_dirs = []
+                
+                for item in dir_path.iterdir():
+                    if item.is_dir():
+                        try:
+                            dir_size = sum(f.stat().st_size for f in item.rglob('*') if f.is_file())
+                            total_size += dir_size
+                            if dir_size > 100 * 1024 * 1024:  # Only show directories > 100MB
+                                large_dirs.append((item.name, dir_size))
+                        except (OSError, PermissionError):
+                            continue
+                
+                w(f"### {dir_name}")
+                w(f"**Total size**: {format_bytes(total_size)}")
+                w("")
+                
+                if large_dirs:
+                    large_dirs.sort(key=lambda x: x[1], reverse=True)
+                    w("Top directories by size:")
+                    w("")
+                    w("| Directory | Size |")
+                    w("|-----------|------|")
+                    for name, size in large_dirs[:20]:  # Show top 20
+                        w(f"| {name} | {format_bytes(size)} |")
+                    w("")
+                else:
+                    w("No directories larger than 100MB found.")
+                    w("")
+                    
+            except (OSError, PermissionError):
+                w(f"Access denied for {dir_name}")
+                w("")
+
+    # --- Games Directory Analysis ---
+    w("## Games Directory Analysis")
+    w("")
+    
+    common_game_paths = [
+        Path("C:/Games"),
+        Path("C:/Steam"),
+        Path("C:/Program Files (x86)/Steam"),
+        Path("C:/Program Files/Epic Games"),
+        Path("C:/Program Files/Origin Games"),
+        Path("C:/Program Files (x86)/Origin Games"),
+        Path("C:/GOG Games")
+    ]
+    
+    found_games = False
+    for game_path in common_game_paths:
+        if game_path.exists():
+            found_games = True
+            try:
+                total_size = sum(f.stat().st_size for f in game_path.rglob('*') if f.is_file())
+                w(f"**{game_path}**: {format_bytes(total_size)}")
+                
+                # Show top game directories
+                game_dirs = []
+                for item in game_path.iterdir():
+                    if item.is_dir():
+                        try:
+                            dir_size = sum(f.stat().st_size for f in item.rglob('*') if f.is_file())
+                            if dir_size > 50 * 1024 * 1024:  # Only show > 50MB
+                                game_dirs.append((item.name, dir_size))
+                        except (OSError, PermissionError):
+                            continue
+                
+                if game_dirs:
+                    game_dirs.sort(key=lambda x: x[1], reverse=True)
+                    w("| Game | Size |")
+                    w("|------|------|")
+                    for name, size in game_dirs[:15]:  # Show top 15 games
+                        w(f"| {name} | {format_bytes(size)} |")
+                w("")
+                
+            except (OSError, PermissionError):
+                w(f"Access denied for {game_path}")
+                w("")
+    
+    if not found_games:
+        w("No common game directories found.")
+        w("")
+
+    # --- Large Files Summary ---
+    w("## Large Files Summary")
+    w("")
+    w("Searching for files larger than 500MB across user directories...")
+    w("")
+    
+    large_files = []
+    search_dirs = [Path("C:/Users")] + [p for _, p in program_dirs]
+    
+    for base_dir in search_dirs:
+        if not base_dir.exists():
+            continue
+            
+        try:
+            for file_path in base_dir.rglob('*'):
+                try:
+                    if file_path.is_file():
+                        size = file_path.stat().st_size
+                        if size > 500 * 1024 * 1024:  # > 500MB
+                            large_files.append((file_path, size))
+                            if len(large_files) >= 50:  # Limit to 50 files
+                                break
+                except (OSError, PermissionError):
+                    continue
+            if len(large_files) >= 50:
+                break
+        except (OSError, PermissionError):
+            continue
+    
+    if large_files:
+        large_files.sort(key=lambda x: x[1], reverse=True)
+        w("| File Path | Size |")
+        w("|-----------|------|")
+        for file_path, size in large_files:
+            # Truncate long paths for display
+            path_str = str(file_path)
+            if len(path_str) > 80:
+                path_str = "..." + path_str[-77:]
+            w(f"| {path_str} | {format_bytes(size)} |")
+    else:
+        w("No files larger than 500MB found in the searched directories.")
+    w("")
+
+    DS_FILE.write_text("\n".join(lines), encoding="utf-8")
+
+
+# ============================================================
 # Main
 # ============================================================
 def main() -> None:
@@ -953,12 +1252,16 @@ def main() -> None:
     generate_software()
     print(f"  [OK] {SW_FILE}")
 
+    generate_disk_space()
+    print(f"  [OK] {DS_FILE}")
+
     print()
-    print("Done. 3 files generated:")
+    print("Done. 4 files generated:")
     for label, path in [
         ("Hardware", HW_FILE),
         ("Software", SW_FILE),
         ("State", ST_FILE),
+        ("Disk Space", DS_FILE),
     ]:
         size = format_bytes(path.stat().st_size) if path.exists() else "?"
         print(f"  {label:10s}: {path} ({size})")

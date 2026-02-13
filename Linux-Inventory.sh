@@ -1,14 +1,16 @@
 #!/bin/bash
 
-# System inventory script - generates 3 Markdown reports:
+# System inventory script - generates 4 Markdown reports:
 #   1. hardware.md   - static hardware info (unchanged unless physical changes)
 #   2. software.md   - installed software & versions (unchanged unless install/update)
 #   3. state.md      - live runtime state (CPU, RAM, disk usage, processes...)
+#   4. diskspace.md  - disk space usage by category (images, documents, programs, games...)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HW_FILE="${SCRIPT_DIR}/jInventory-${HOSTNAME}-0-hardware.md"
 SW_FILE="${SCRIPT_DIR}/jInventory-${HOSTNAME}-1-software.md"
 ST_FILE="${SCRIPT_DIR}/jInventory-${HOSTNAME}-2-state.md"
+DS_FILE="${SCRIPT_DIR}/jInventory-${HOSTNAME}-3-diskspace.md"
 
 TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S %Z')
 HOSTNAME=$(cat /proc/sys/kernel/hostname)
@@ -690,6 +692,454 @@ EOF
 }
 
 # ============================================================
+# 4. DISK SPACE REPORT (usage by category)
+# ============================================================
+generate_disk_space() {
+    local F="$DS_FILE"
+    cat > "$F" <<EOF
+# Disk Space Usage Analysis - ${HOSTNAME}
+
+> Generated: ${TIMESTAMP}
+
+EOF
+
+    # --- Overall Disk Usage Summary ---
+    {
+        echo "## Overall Disk Usage Summary"
+        echo ""
+        echo "| Filesystem | Size | Used | Avail | Use% | Mount |"
+        echo "|------------|------|------|-------|------|-------|"
+        df -h --output=source,size,used,avail,pcent,target 2>/dev/null \
+            | grep -v tmpfs | grep -v devtmpfs | grep -v overlay | grep -v efivar | grep -v '/run/credentials' \
+            | tail -n +2 \
+            | while read -r src size used avail pct mnt; do
+                [[ "$src" == "none" ]] && continue
+                echo "| ${src} | ${size} | ${used} | ${avail} | ${pct} | ${mnt} |"
+            done
+        echo ""
+    } >> "$F"
+
+    # --- Scan all mounts once (keep categories in sync with Windows / macOS scripts) ---
+    local _scan_tmpdir
+    _scan_tmpdir=$(mktemp -d)
+    local MAX_FILES=200000
+
+    # Shared awk categorisation script
+    local _AWK_CAT='
+        function ext_cat(ext) {
+            if (ext ~ /^\.(jpe?g|png|gif|bmp|tiff?|webp|svg|ico|heic|heif|raw|cr2|nef|psd|avif|eps|jp2)$/) return "Images"
+            if (ext ~ /^\.(mp4|avi|mkv|mov|wmv|flv|webm|m4v|3gp|3g2|mts|m2ts|mpg|mpeg|vob|ogv|ts)$/) return "Videos"
+            if (ext ~ /^\.(mp3|wav|flac|aac|ogg|wma|m4a|opus|aiff|midi?|alac|ape)$/) return "Audio"
+            if (ext ~ /^\.(pdf|docx?|txt|rtf|odt|xlsx?|pptx?|od[sp]|csv|epub|md|tex|pages|numbers|key)$/) return "Documents"
+            if (ext ~ /^\.(eml|msg)$/) return "Emails"
+            if (ext ~ /^\.(zip|rar|7z|tar|gz|bz2|xz|zst)$/) return "Archives"
+            if (ext ~ /^\.(py|jsx?|tsx?|html|s?css|cpp|[ch]|hpp|java|php|rb|go|rs|swift|kt|sh|bat|ps1|json|xml|ya?ml|toml|sql|lua|pl|dart|vue|cs)$/) return "Code_Source"
+            if (ext ~ /^\.(exe|dll|sys|so|dylib|bin|com)$/) return "Executables"
+            if (ext ~ /^\.(msi|iso|dmg|img|cab|pkg|deb|rpm|appimage|snap|flatpak)$/) return "Installers"
+            if (ext ~ /^\.(vdi|vmdk|vhdx?|qcow2?|ova|ovf)$/) return "VM_Disks"
+            if (ext ~ /^\.(ttf|otf|woff2?|eot)$/) return "Fonts"
+            return "Other"
+        }
+        {
+            size = $1; fname = $2
+            n = split(fname, parts, ".")
+            ext = (n > 1) ? "." tolower(parts[n]) : ""
+            cat = ext_cat(ext)
+            count[cat]++; total[cat] += size; scanned++
+        }
+        END {
+            printf "SCANNED=%d\n", scanned
+            for (cat in count) printf "DATA\t%s\t%d\t%d\n", cat, count[cat], total[cat]
+        }'
+
+    local _mount_list
+    _mount_list=$(df -h --output=target 2>/dev/null \
+        | grep -v tmpfs | grep -v devtmpfs | grep -v overlay | grep -v efivar | grep -v '/run/credentials' \
+        | tail -n +2 \
+        | awk 'NF{print $1}')
+
+    while read -r mnt; do
+        [[ -z "$mnt" ]] && continue
+        local _safe_name
+        _safe_name=$(echo "$mnt" | tr '/' '_')
+        find "$mnt" -xdev -type f -printf '%s\t%f\n' 2>/dev/null \
+            | head -n "$MAX_FILES" \
+            | awk -F'\t' "$_AWK_CAT" > "${_scan_tmpdir}/${_safe_name}"
+    done <<< "$_mount_list"
+
+    # --- File Categories (all mounts combined) ---
+    {
+        echo "## File Categories (all mounts)"
+        echo ""
+
+        local global_output
+        global_output=$(cat "${_scan_tmpdir}"/* 2>/dev/null | grep '^DATA' \
+            | awk -F'\t' '{cat=$2; cnt=$3; tot=$4; count[cat]+=cnt; total[cat]+=tot}
+                END {for (cat in count) printf "DATA\t%s\t%d\t%d\n", cat, count[cat], total[cat]}')
+        local global_scanned=0
+        while read -r line; do
+            local n=${line#SCANNED=}
+            global_scanned=$((global_scanned + n))
+        done < <(grep '^SCANNED=' "${_scan_tmpdir}"/* 2>/dev/null)
+
+        if [[ "$global_scanned" -gt 0 ]]; then
+            local truncated=""
+            [[ "$global_scanned" -ge "$MAX_FILES" ]] && truncated=" (truncated on some mounts)"
+            echo "*Scanned ${global_scanned} files${truncated}*"
+            echo ""
+            echo "| Category | Count | Total Size |"
+            echo "|----------|-------|------------|"
+            echo "$global_output" | sort -t$'\t' -k4 -rn \
+                | while IFS=$'\t' read -r _tag cat cnt tot; do
+                    echo "| ${cat} | ${cnt} | $(numfmt --to=iec "$tot") |"
+                done
+            echo ""
+        else
+            echo "(no files found)"
+            echo ""
+        fi
+    } >> "$F"
+
+    # --- File Categories per Mount ---
+    {
+        echo "## File Categories per Mount"
+        echo ""
+
+        while read -r mnt; do
+            [[ -z "$mnt" ]] && continue
+            local _safe_name
+            _safe_name=$(echo "$mnt" | tr '/' '_')
+            local scan_file="${_scan_tmpdir}/${_safe_name}"
+
+            echo "### Mount ${mnt}"
+            echo ""
+
+            if [[ ! -s "$scan_file" ]]; then
+                echo "(no files found or access denied)"
+                echo ""
+                continue
+            fi
+
+            local scanned
+            scanned=$(grep '^SCANNED=' "$scan_file" | cut -d= -f2)
+            local truncated=""
+            [[ "$scanned" -ge "$MAX_FILES" ]] && truncated=" (truncated)"
+
+            echo "*Scanned ${scanned} files${truncated}*"
+            echo ""
+
+            echo "| Category | Count | Total Size |"
+            echo "|----------|-------|------------|"
+            grep '^DATA' "$scan_file" | sort -t$'\t' -k4 -rn \
+                | while IFS=$'\t' read -r _tag cat cnt tot; do
+                    echo "| ${cat} | ${cnt} | $(numfmt --to=iec "$tot") |"
+                done
+            echo ""
+
+        done <<< "$_mount_list"
+    } >> "$F"
+
+    rm -rf "$_scan_tmpdir"
+
+    # --- Analyze User Directories ---
+    {
+        echo "## User Directory Analysis"
+        echo ""
+        
+        # Get all user home directories
+        for user_home in /home/*; do
+            [[ ! -d "$user_home" ]] && continue
+            local username
+            username=$(basename "$user_home")
+            
+            echo "### User: ${username}"
+            echo ""
+            
+            # Analyze main user directories
+            local dirs_to_analyze=("Desktop" "Documents" "Downloads" "Pictures" "Videos" "Music" ".local" ".cache")
+            local user_total=0
+            
+            for dir_name in "${dirs_to_analyze[@]}"; do
+                local dir_path="${user_home}/${dir_name}"
+                if [[ -d "$dir_path" ]]; then
+                    local dir_size
+                    dir_size=$(du -sb "$dir_path" 2>/dev/null | cut -f1)
+                    if [[ -n "$dir_size" && "$dir_size" != "0" ]]; then
+                        user_total=$((user_total + dir_size))
+                        echo "- **${dir_name}**: $(numfmt --to=iec "$dir_size")"
+                    fi
+                fi
+            done
+            
+            if [[ $user_total -gt 0 ]]; then
+                echo "**Total for ${username}**: $(numfmt --to=iec "$user_total")"
+            else
+                echo "**Total for ${username}**: No accessible data"
+            fi
+            echo ""
+            
+            # Detailed category analysis for important directories
+            local important_dirs=("${user_home}/Documents" "${user_home}/Downloads" "${user_home}/Desktop")
+            for dir_path in "${important_dirs[@]}"; do
+                [[ ! -d "$dir_path" ]] && continue
+                
+                local dir_size
+                dir_size=$(du -sb "$dir_path" 2>/dev/null | cut -f1)
+                if [[ -z "$dir_size" || "$dir_size" -lt $((100 * 1024 * 1024)) ]]; then
+                    continue  # Skip if smaller than 100MB
+                fi
+                
+                echo "#### Category Analysis for $(basename "$dir_path")"
+                echo ""
+                
+                # Analyze file categories
+                local docs_size=0 images_size=0 videos_size=0 music_size=0 archives_size=0 dev_size=0 other_size=0
+                
+                find "$dir_path" -type f -size +50M 2>/dev/null | while read -r file; do
+                    local ext="${file##*.}"
+                    ext="${ext,,}"  # lowercase
+                    
+                    case "$ext" in
+                        pdf|doc|docx|txt|rtf|odt|xls|xlsx|ppt|pptx|ods|odp)
+                            ((docs_size += $(stat -c%s "$file" 2>/dev/null || echo 0)))
+                            ;;
+                        jpg|jpeg|png|gif|bmp|tiff|tif|webp|svg|ico)
+                            ((images_size += $(stat -c%s "$file" 2>/dev/null || echo 0)))
+                            ;;
+                        mp4|avi|mkv|mov|wmv|flv|webm|m4v|3gp)
+                            ((videos_size += $(stat -c%s "$file" 2>/dev/null || echo 0)))
+                            ;;
+                        mp3|wav|flac|aac|ogg|wma|m4a|opus)
+                            ((music_size += $(stat -c%s "$file" 2>/dev/null || echo 0)))
+                            ;;
+                        zip|rar|7z|tar|gz|bz2|xz)
+                            ((archives_size += $(stat -c%s "$file" 2>/dev/null || echo 0)))
+                            ;;
+                        py|js|html|css|cpp|c|java|php|rb|go|rs|swift)
+                            ((dev_size += $(stat -c%s "$file" 2>/dev/null || echo 0)))
+                            ;;
+                        *)
+                            ((other_size += $(stat -c%s "$file" 2>/dev/null || echo 0)))
+                            ;;
+                    esac
+                done
+                
+                local dir_total=$((docs_size + images_size + videos_size + music_size + archives_size + dev_size + other_size))
+                
+                if [[ $dir_total -gt 0 ]]; then
+                    echo "| Category | Size | Percentage |"
+                    echo "|----------|------|------------|"
+                    
+                    if [[ $docs_size -gt 0 ]]; then
+                        local pct=$((docs_size * 100 / dir_total))
+                        echo "| Documents | $(numfmt --to=iec "$docs_size") | ${pct}% |"
+                    fi
+                    if [[ $images_size -gt 0 ]]; then
+                        local pct=$((images_size * 100 / dir_total))
+                        echo "| Images | $(numfmt --to=iec "$images_size") | ${pct}% |"
+                    fi
+                    if [[ $videos_size -gt 0 ]]; then
+                        local pct=$((videos_size * 100 / dir_total))
+                        echo "| Videos | $(numfmt --to=iec "$videos_size") | ${pct}% |"
+                    fi
+                    if [[ $music_size -gt 0 ]]; then
+                        local pct=$((music_size * 100 / dir_total))
+                        echo "| Music | $(numfmt --to=iec "$music_size") | ${pct}% |"
+                    fi
+                    if [[ $archives_size -gt 0 ]]; then
+                        local pct=$((archives_size * 100 / dir_total))
+                        echo "| Archives | $(numfmt --to=iec "$archives_size") | ${pct}% |"
+                    fi
+                    if [[ $dev_size -gt 0 ]]; then
+                        local pct=$((dev_size * 100 / dir_total))
+                        echo "| Development | $(numfmt --to=iec "$dev_size") | ${pct}% |"
+                    fi
+                    if [[ $other_size -gt 0 ]]; then
+                        local pct=$((other_size * 100 / dir_total))
+                        echo "| Other | $(numfmt --to=iec "$other_size") | ${pct}% |"
+                    fi
+                    echo ""
+                else
+                    echo "No large files found for detailed analysis."
+                    echo ""
+                fi
+            done
+        done
+    } >> "$F"
+
+    # --- System Directory Analysis ---
+    {
+        echo "## System Directory Analysis"
+        echo ""
+        
+        local system_dirs=("/usr" "/opt" "/var" "/tmp" "/srv")
+        
+        for dir_path in "${system_dirs[@]}"; do
+            [[ ! -d "$dir_path" ]] && continue
+            
+            local dir_size
+            dir_size=$(du -sb "$dir_path" 2>/dev/null | cut -f1)
+            if [[ -n "$dir_size" && "$dir_size" != "0" ]]; then
+                echo "- **${dir_path}**: $(numfmt --to=iec "$dir_size")"
+            fi
+        done
+        echo ""
+        
+        # Analyze /opt for applications and games
+        if [[ -d "/opt" ]]; then
+            echo "### Applications in /opt"
+            echo ""
+            echo "| Directory | Size |"
+            echo "|-----------|------|"
+            find /opt -maxdepth 1 -type d -not -path "/opt" 2>/dev/null | while read -r app_dir; do
+                local app_size
+                app_size=$(du -sb "$app_dir" 2>/dev/null | cut -f1)
+                if [[ -n "$app_size" && "$app_size" -gt $((50 * 1024 * 1024)) ]]; then
+                    local app_name
+                    app_name=$(basename "$app_dir")
+                    echo "| ${app_name} | $(numfmt --to=iec "$app_size") |"
+                fi
+            done
+            echo ""
+        fi
+    } >> "$F"
+
+    # --- Games Directory Analysis ---
+    {
+        echo "## Games Directory Analysis"
+        echo ""
+        
+        local game_dirs=("/home"/*/".steam" "/home"/*/".local" "/usr/games" "/opt" "/var/games")
+        local found_games=false
+        
+        for search_path in "${game_dirs[@]}"; do
+            [[ ! -d "$search_path" ]] && continue
+            
+            # Look for Steam, Lutris, Heroic, etc.
+            local steam_dir=$(find "$search_path" -name "steamapps" -type d 2>/dev/null | head -5)
+            if [[ -n "$steam_dir" ]]; then
+                found_games=true
+                echo "### Steam Games Found"
+                echo ""
+                echo "| Game Directory | Size |"
+                echo "|----------------|------|"
+                echo "$steam_dir" | while read -r steam_path; do
+                    local user_name
+                    user_name=$(echo "$steam_path" | grep -o '/home/[^/]*' | cut -d'/' -f3)
+                    echo "**Steam games for ${user_name}:**"
+                    find "$steam_path" -name "*.acf" -exec dirname {} \; 2>/dev/null | while read -r game_dir; do
+                        local game_size
+                        game_size=$(du -sb "$game_dir" 2>/dev/null | cut -f1)
+                        if [[ -n "$game_size" && "$game_size" -gt $((100 * 1024 * 1024)) ]]; then
+                            local game_name
+                            game_name=$(basename "$game_dir")
+                            echo "| ${game_name} | $(numfmt --to=iec "$game_size") |"
+                        fi
+                    done
+                    echo ""
+                done
+            fi
+        done
+        
+        if [[ "$found_games" == false ]]; then
+            echo "No common game directories found (Steam, Lutris, etc.)."
+            echo ""
+        fi
+    } >> "$F"
+
+    # --- Large Files Summary ---
+    {
+        echo "## Large Files Summary"
+        echo ""
+        echo "Searching for files larger than 500MB in user directories and /opt..."
+        echo ""
+        
+        local search_paths=("/home" "/opt" "/usr")
+        local file_count=0
+        
+        echo "| File Path | Size |"
+        echo "|-----------|------|"
+        
+        for search_path in "${search_paths[@]}"; do
+            [[ ! -d "$search_path" ]] && continue
+            
+            find "$search_path" -type f -size +500M 2>/dev/null | while read -r file_path; do
+                [[ $file_count -ge 50 ]] && break  # Limit to 50 files
+                
+                local file_size
+                file_size=$(stat -c%s "$file_path" 2>/dev/null)
+                if [[ -n "$file_size" ]]; then
+                    # Truncate long paths for display
+                    local display_path="$file_path"
+                    if [[ ${#display_path} -gt 80 ]]; then
+                        display_path="...${display_path: -77}"
+                    fi
+                    echo "| ${display_path} | $(numfmt --to=iec "$file_size") |"
+                    ((file_count++))
+                fi
+            done
+            
+            [[ $file_count -ge 50 ]] && break
+        done
+        
+        if [[ $file_count -eq 0 ]]; then
+            echo "No files larger than 500MB found in the searched directories."
+        fi
+        echo ""
+    } >> "$F"
+
+    # --- Package Size Analysis (if expac available) ---
+    if [[ ${TOOLS[expac]} -eq 1 ]]; then
+        {
+            echo "## Package Size Analysis"
+            echo ""
+            echo "### Top 30 Packages by Size"
+            echo ""
+            echo "| Size | Package | Version |"
+            echo "|------|---------|---------|"
+            expac -H M '%m\t%n\t%v' 2>/dev/null | sort -rn | head -30 | while IFS=$'\t' read -r size name version; do
+                echo "| ${size} | ${name} | ${version} |"
+            done
+            echo ""
+            
+            echo "### Total Size by Category"
+            echo ""
+            local dev_total=0 games_total=0 media_total=0 system_total=0
+            
+            expac -H M '%m\t%n' 2>/dev/null | while IFS=$'\t' read -r size name; do
+                if [[ "$name" =~ (gcc|python|node|java|git|docker|vim|emacs) ]]; then
+                    ((dev_total += ${size//[KBMG]/}))
+                elif [[ "$name" =~ (steam|lutris|wine) ]]; then
+                    ((games_total += ${size//[KBMG]/}))
+                elif [[ "$name" =~ (vlc|mpv|ffmpeg|gimp|inkscape) ]]; then
+                    ((media_total += ${size//[KBMG]/}))
+                else
+                    ((system_total += ${size//[KBMG]/}))
+                fi
+            done
+            
+            echo "| Category | Estimated Size |"
+            echo "|----------|----------------|"
+            if [[ $dev_total -gt 0 ]]; then
+                echo "| Development | $(numfmt --to=iec "$((dev_total * 1024))") |"
+            fi
+            if [[ $games_total -gt 0 ]]; then
+                echo "| Games | $(numfmt --to=iec "$((games_total * 1024))") |"
+            fi
+            if [[ $media_total -gt 0 ]]; then
+                echo "| Media | $(numfmt --to=iec "$((media_total * 1024))") |"
+            fi
+            if [[ $system_total -gt 0 ]]; then
+                echo "| System | $(numfmt --to=iec "$((system_total * 1024))") |"
+            fi
+            echo ""
+        } >> "$F"
+    fi
+
+    chmod 644 "$F"
+}
+
+# ============================================================
 # Main
 # ============================================================
 echo "Generating system inventory..."
@@ -704,8 +1154,12 @@ echo "  [OK] ${HW_FILE}"
 generate_software
 echo "  [OK] ${SW_FILE}"
 
+generate_disk_space
+echo "  [OK] ${DS_FILE}"
+
 echo ""
-echo "Done. 3 files generated:"
-echo "  Hardware : ${HW_FILE} ($(du -h "$HW_FILE" | cut -f1))"
-echo "  Software : ${SW_FILE} ($(du -h "$SW_FILE" | cut -f1))"
-echo "  State    : ${ST_FILE} ($(du -h "$ST_FILE" | cut -f1))"
+echo "Done. 4 files generated:"
+echo "  Hardware   : ${HW_FILE} ($(du -h "$HW_FILE" | cut -f1))"
+echo "  Software   : ${SW_FILE} ($(du -h "$SW_FILE" | cut -f1))"
+echo "  State      : ${ST_FILE} ($(du -h "$ST_FILE" | cut -f1))"
+echo "  Disk Space : ${DS_FILE} ($(du -h "$DS_FILE" | cut -f1))"
