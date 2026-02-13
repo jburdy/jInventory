@@ -4,19 +4,23 @@
 Windows 11 System Inventory Script
 Port of Linux-Inventory.sh for Windows 11 using Python 3.14+
 
-Generates 4 Markdown reports:
+Generates 6 Markdown reports:
   1. hardware.md   - static hardware info
   2. software.md   - installed software & versions
-  3. state.md      - live runtime state (CPU, RAM, disk usage, processes...)
-  4. diskspace.md  - disk space usage by category (images, documents, programs, games...)
+  3. state.md      - live runtime state
+  4. diskspace.md  - disk space usage by category
+  5. filestats.md  - detailed extension breakdown for Other files
+  6. catpaths.md   - primary storage paths per file category
 """
 
+import concurrent.futures
 import datetime
 import json
 import platform
 import re
 import shutil
 import socket
+import stat as stat_mod
 import subprocess
 import sys
 import winreg
@@ -39,6 +43,8 @@ HW_FILE = SCRIPT_DIR / f"jInventory-{HOSTNAME}-0-hardware.md"
 SW_FILE = SCRIPT_DIR / f"jInventory-{HOSTNAME}-1-software.md"
 ST_FILE = SCRIPT_DIR / f"jInventory-{HOSTNAME}-2-state.md"
 DS_FILE = SCRIPT_DIR / f"jInventory-{HOSTNAME}-3-diskspace.md"
+FS_FILE = SCRIPT_DIR / f"jInventory-{HOSTNAME}-4-filestats.md"
+CP_FILE = SCRIPT_DIR / f"jInventory-{HOSTNAME}-5-catpaths.md"
 
 
 # ---------------------------------------------------------------------------
@@ -115,66 +121,91 @@ def format_bytes(n: int | float) -> str:
     return f"{n:.1f} PB"
 
 
-# -- File-type categories (keep in sync with MacOS / Linux scripts) --
-_CATEGORIES: dict[str, set[str]] = {
-    "Images": {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp",
-               ".svg", ".ico", ".heic", ".heif", ".raw", ".cr2", ".nef", ".psd",
-               ".avif", ".eps", ".jp2"},
-    "Videos": {".mp4", ".avi", ".mkv", ".mov", ".wmv", ".flv", ".webm", ".m4v",
-               ".3gp", ".mts", ".m2ts", ".mpg", ".mpeg", ".vob", ".ogv", ".ts",
-               ".3g2"},
-    "Audio": {".mp3", ".wav", ".flac", ".aac", ".ogg", ".wma", ".m4a", ".opus",
-              ".aiff", ".mid", ".midi", ".alac", ".ape"},
-    "Documents": {".pdf", ".doc", ".docx", ".txt", ".rtf", ".odt", ".xls", ".xlsx",
-                  ".ppt", ".pptx", ".ods", ".odp", ".csv", ".epub", ".md", ".tex",
-                  ".pages", ".numbers", ".key"},
-    "Emails": {".eml", ".msg"},
-    "Archives": {".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".zst"},
-    "Code_Source": {".py", ".js", ".ts", ".jsx", ".tsx", ".html", ".css", ".scss",
-                    ".cpp", ".c", ".h", ".hpp", ".java", ".php", ".rb", ".go",
-                    ".rs", ".swift", ".kt", ".sh", ".bat", ".ps1", ".json", ".xml",
-                    ".yaml", ".yml", ".toml", ".sql", ".lua", ".pl", ".dart",
-                    ".vue", ".cs"},
-    "Executables": {".exe", ".dll", ".sys", ".so", ".dylib", ".bin", ".com"},
-    "Installers": {".msi", ".iso", ".dmg", ".img", ".cab", ".pkg", ".deb", ".rpm",
-                   ".appimage", ".snap", ".flatpak"},
-    "VM_Disks": {".vdi", ".vmdk", ".vhd", ".vhdx", ".qcow", ".qcow2", ".ova",
-                 ".ovf"},
-    "Fonts": {".ttf", ".otf", ".woff", ".woff2", ".eot"},
-}
-_EXT_TO_CAT: dict[str, str] = {
-    ext: cat for cat, exts in _CATEGORIES.items() for ext in exts
-}
+# -- File-type categories (loaded from categories.json, shared across scripts) --
+def _load_categories() -> tuple[dict[str, set[str]], dict[str, str]]:
+    """Load categories from categories.json next to this script."""
+    cat_file = SCRIPT_DIR / "categories.json"
+    raw: dict[str, list[str]] = json.loads(cat_file.read_text(encoding="utf-8"))
+    categories = {cat: set(exts) for cat, exts in raw.items()}
+    ext_to_cat = {ext: cat for cat, exts in categories.items() for ext in exts}
+    return categories, ext_to_cat
 
 
-def _scan_file_categories(root: Path, max_files: int = 200_000) -> tuple[dict[str, list[int]], int]:
-    """Walk *root* and collect {category: [count, total_bytes]}.
+_CATEGORIES, _EXT_TO_CAT = _load_categories()
 
-    Stops after *max_files* to keep runtime reasonable on large drives.
-    Returns (stats_dict, files_scanned).
+
+# Type alias for scan return value (matches Linux-Inventory.py)
+type ScanResult = tuple[
+    dict[str, list[int]],              # cat_stats
+    dict[str, list[int]],              # other_ext_stats
+    dict[str, dict[str, list[int]]],   # cat_dir_stats {cat: {subdir: [n, bytes]}}
+    int,                               # files_scanned
+]
+
+
+def _scan_volume(root: Path, max_files: int = 200_000) -> ScanResult:
+    """Scan files under *root* (no symlink follow).
+
+    Uses lstat() per entry for performance.
+    Returns (cat_stats, other_ext_stats, cat_dir_stats, files_scanned).
     """
     stats: dict[str, list[int]] = {}
+    other_exts: dict[str, list[int]] = {}
+    cat_dirs: dict[str, dict[str, list[int]]] = {}
     scanned = 0
-    try:
-        for entry in root.rglob("*"):
-            if scanned >= max_files:
-                break
-            try:
-                if entry.is_file():
-                    ext = entry.suffix.lower() if entry.suffix else ""
-                    cat = _EXT_TO_CAT.get(ext, "Other")
-                    size = entry.stat().st_size
-                    if cat in stats:
-                        stats[cat][0] += 1
-                        stats[cat][1] += size
-                    else:
-                        stats[cat] = [1, size]
-                    scanned += 1
-            except (OSError, PermissionError):
-                continue
-    except (OSError, PermissionError):
-        pass
-    return stats, scanned
+    root_depth = len(root.parts)
+
+    stack = [root]
+    while stack and scanned < max_files:
+        current = stack.pop()
+        try:
+            for entry in current.iterdir():
+                if scanned >= max_files:
+                    break
+                try:
+                    st = entry.lstat()
+                    mode = st.st_mode
+                    if stat_mod.S_ISLNK(mode):
+                        continue
+                    if stat_mod.S_ISDIR(mode):
+                        stack.append(entry)
+                    elif stat_mod.S_ISREG(mode):
+                        ext = entry.suffix.lower()
+                        cat = _EXT_TO_CAT.get(ext, "Other")
+                        if cat in stats:
+                            stats[cat][0] += 1
+                            stats[cat][1] += st.st_size
+                        else:
+                            stats[cat] = [1, st.st_size]
+                        # Track per-extension detail for Other files
+                        if cat == "Other":
+                            key = ext if ext else "(no ext)"
+                            if key in other_exts:
+                                other_exts[key][0] += 1
+                                other_exts[key][1] += st.st_size
+                            else:
+                                other_exts[key] = [1, st.st_size]
+                        # Track first-level subdir per category
+                        eparts = entry.parts
+                        if len(eparts) > root_depth + 1:
+                            dkey = eparts[root_depth]
+                        else:
+                            dkey = "."
+                        dirs = cat_dirs.get(cat)
+                        if dirs is None:
+                            cat_dirs[cat] = {dkey: [1, st.st_size]}
+                        elif dkey in dirs:
+                            dirs[dkey][0] += 1
+                            dirs[dkey][1] += st.st_size
+                        else:
+                            dirs[dkey] = [1, st.st_size]
+                        scanned += 1
+                except (OSError, PermissionError):
+                    continue
+        except (OSError, PermissionError):
+            continue
+
+    return stats, other_exts, cat_dirs, scanned
 
 
 # ============================================================
@@ -953,7 +984,7 @@ def generate_state() -> None:
 # ============================================================
 # 4. DISK SPACE REPORT (usage by category)
 # ============================================================
-def generate_disk_space() -> None:
+def generate_disk_space() -> dict[str, ScanResult]:
     lines: list[str] = []
     w = lines.append
 
@@ -967,12 +998,14 @@ def generate_disk_space() -> None:
     w("")
     w("| Drive | Total | Used | Free | Usage % |")
     w("|-------|-------|------|------|---------|")
-    
+
     total_system_usage = 0
+    accessible_mounts: list[str] = []
     for part in psutil.disk_partitions():
         try:
             usage = psutil.disk_usage(part.mountpoint)
             total_system_usage += usage.used
+            accessible_mounts.append(part.mountpoint)
             pct = f"{usage.percent:.1f}%"
             w(
                 f"| {part.mountpoint} | {format_bytes(usage.total)} | "
@@ -984,14 +1017,26 @@ def generate_disk_space() -> None:
     w(f"**Total system storage used**: {format_bytes(total_system_usage)}")
     w("")
 
-    # -- Scan all drives once, reuse for global + per-drive --
-    drive_results: dict[str, tuple[dict[str, list[int]], int]] = {}
-    for part in psutil.disk_partitions():
-        try:
-            psutil.disk_usage(part.mountpoint)
-        except (PermissionError, OSError):
-            continue
-        drive_results[part.mountpoint] = _scan_file_categories(Path(part.mountpoint))
+    # -- Scan all drives in parallel --
+    print("  Scanning file categories (parallel)...")
+    drive_results: dict[str, ScanResult] = {}
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(4, max(1, len(accessible_mounts)))
+    ) as pool:
+        futures = {
+            pool.submit(_scan_volume, Path(m)): m for m in accessible_mounts
+        }
+        for future in concurrent.futures.as_completed(futures, timeout=600):
+            mount = futures[future]
+            try:
+                result = future.result(timeout=300)
+                drive_results[mount] = result
+                _, _, _, scanned = result
+                print(f"    {mount}: {scanned:,} files scanned")
+            except Exception as exc:
+                print(f"    {mount}: scan failed ({exc})")
+                drive_results[mount] = ({}, {}, {}, 0)
 
     # --- File Categories (all drives combined) ---
     w("## File Categories (all drives)")
@@ -999,7 +1044,7 @@ def generate_disk_space() -> None:
 
     global_stats: dict[str, list[int]] = {}
     global_scanned = 0
-    for stats, scanned in drive_results.values():
+    for stats, _oext, _cdirs, scanned in drive_results.values():
         global_scanned += scanned
         for cat, (cnt, tot) in stats.items():
             if cat in global_stats:
@@ -1026,19 +1071,17 @@ def generate_disk_space() -> None:
     w("## File Categories per Drive")
     w("")
 
-    for mountpoint, (stats, scanned) in drive_results.items():
-        w(f"### Drive {mountpoint}")
+    for mount in accessible_mounts:
+        w(f"### Drive {mount}")
         w("")
-
+        stats, _oext, _cdirs, scanned = drive_results.get(mount, ({}, {}, {}, 0))
         if not stats:
             w("(no files found or access denied)")
             w("")
             continue
-
         truncated = " (truncated)" if scanned >= 200_000 else ""
         w(f"*Scanned {scanned:,} files{truncated}*")
         w("")
-
         by_size = sorted(stats.items(), key=lambda x: x[1][1], reverse=True)
         w("| Category | Count | Total Size |")
         w("|----------|-------|------------|")
@@ -1233,6 +1276,198 @@ def generate_disk_space() -> None:
     w("")
 
     DS_FILE.write_text("\n".join(lines), encoding="utf-8")
+    return drive_results
+
+
+# ============================================================
+# 5. FILE STATS REPORT (Other extensions breakdown)
+# ============================================================
+def generate_filestats(
+    drive_results: dict[str, ScanResult],
+) -> None:
+    """Generate a report breaking down Other files by extension."""
+    lines: list[str] = []
+    w = lines.append
+
+    w(f"# File Extension Statistics (Other) - {HOSTNAME}")
+    w("")
+    w(f"> Generated: {TIMESTAMP}")
+    w("")
+    w("This report lists file extensions in the **Other** category that are significant")
+    w("(>= 10 MB total or >= 1000 files). Use it to identify candidates for new categories.")
+    w("")
+
+    # --- Global Other extensions (all drives combined) ---
+    global_other: dict[str, list[int]] = {}
+    global_other_count = 0
+    global_other_size = 0
+
+    for _stats, other_exts, _cat_dirs, _scanned in drive_results.values():
+        for ext, (cnt, tot) in other_exts.items():
+            if ext in global_other:
+                global_other[ext][0] += cnt
+                global_other[ext][1] += tot
+            else:
+                global_other[ext] = [cnt, tot]
+            global_other_count += cnt
+            global_other_size += tot
+
+    w("## Global Other Extensions (all drives)")
+    w("")
+    w(f"*{global_other_count:,} files, {len(global_other):,} distinct extensions, "
+      f"{format_bytes(global_other_size)} total*")
+    w("")
+
+    MIN_SIZE = 10 * 1024 * 1024   # 10 MB
+    MIN_COUNT = 1000
+
+    significant = {
+        ext: v for ext, v in global_other.items()
+        if v[1] >= MIN_SIZE or v[0] >= MIN_COUNT
+    }
+
+    if significant:
+        by_size = sorted(significant.items(), key=lambda x: x[1][1], reverse=True)
+        w(f"*Showing {len(significant)} significant extensions "
+          f"(>= 10 MB or >= 1000 files) out of {len(global_other):,} total*")
+        w("")
+        w("| Extension | Count | Total Size |")
+        w("|-----------|-------|------------|")
+        for ext, (count, total_size) in by_size:
+            w(f"| {ext} | {count:,} | {format_bytes(total_size)} |")
+        w("")
+    else:
+        w("(no Other files found)")
+        w("")
+
+    # --- Other extensions per drive ---
+    w("## Other Extensions per Drive")
+    w("")
+
+    for mount, (_stats, other_exts, _cat_dirs, _scanned) in drive_results.items():
+        w(f"### Drive {mount}")
+        w("")
+        if not other_exts:
+            w("(no Other files)")
+            w("")
+            continue
+
+        mount_count = sum(v[0] for v in other_exts.values())
+        mount_size = sum(v[1] for v in other_exts.values())
+        w(f"*{mount_count:,} files, {len(other_exts):,} extensions, "
+          f"{format_bytes(mount_size)} total*")
+        w("")
+
+        sig = {
+            ext: v for ext, v in other_exts.items()
+            if v[1] >= MIN_SIZE or v[0] >= MIN_COUNT
+        }
+        if sig:
+            by_size = sorted(sig.items(), key=lambda x: x[1][1], reverse=True)
+            w("| Extension | Count | Total Size |")
+            w("|-----------|-------|------------|")
+            for ext, (count, total_size) in by_size:
+                w(f"| {ext} | {count:,} | {format_bytes(total_size)} |")
+        else:
+            w("(no extension reaches threshold)")
+        w("")
+
+    FS_FILE.write_text("\n".join(lines), encoding="utf-8")
+
+
+# ============================================================
+# 6. CATEGORY PATHS REPORT (where each category lives)
+# ============================================================
+def generate_category_paths(
+    drive_results: dict[str, ScanResult],
+) -> None:
+    """Generate a report showing primary storage paths for each category."""
+    lines: list[str] = []
+    w = lines.append
+
+    w(f"# Category Locations - {HOSTNAME}")
+    w("")
+    w(f"> Generated: {TIMESTAMP}")
+    w("")
+    w("Primary storage locations for each file category.")
+    w("Use this to quickly navigate to where specific file types are stored.")
+    w("")
+
+    # Collect all (mount, subdir, count, size) per category
+    cat_locations: dict[str, list[tuple[str, str, int, int]]] = {}
+    for mount, (_stats, _other_exts, cat_dirs, _scanned) in drive_results.items():
+        for cat, dirs in cat_dirs.items():
+            if cat == "Other":
+                continue
+            for subdir, (cnt, size) in dirs.items():
+                cat_locations.setdefault(cat, []).append(
+                    (mount, subdir, cnt, size)
+                )
+
+    # Compute global total per category for sorting
+    cat_totals: dict[str, int] = {}
+    for cat, locs in cat_locations.items():
+        cat_totals[cat] = sum(size for _, _, _, size in locs)
+
+    sorted_cats = sorted(cat_totals.items(), key=lambda x: x[1], reverse=True)
+
+    MIN_CAT_SIZE = 10 * 1024 * 1024  # 10 MB
+
+    # --- Quick reference table ---
+    w("## Quick Reference")
+    w("")
+    w("| Category | Total Size | Primary Location | Location Size |")
+    w("|----------|------------|------------------|---------------|")
+
+    for cat, total in sorted_cats:
+        if total < MIN_CAT_SIZE:
+            continue
+        best = max(cat_locations[cat], key=lambda x: x[3])
+        mount, subdir, _cnt, size = best
+        full_path = f"{mount.rstrip('/').rstrip(chr(92))}{chr(92)}{subdir}" if subdir != "." else mount
+        w(f"| {cat} | {format_bytes(total)} | `{full_path}` | {format_bytes(size)} |")
+    w("")
+
+    # --- Detailed view per category ---
+    w("## Detailed Paths per Category")
+    w("")
+
+    for cat, total in sorted_cats:
+        if total < MIN_CAT_SIZE:
+            continue
+
+        w(f"### {cat} ({format_bytes(total)})")
+        w("")
+
+        # Group by mount, then show top subdirs
+        mount_data: dict[str, list[tuple[str, int, int]]] = {}
+        for mount, subdir, cnt, size in cat_locations[cat]:
+            mount_data.setdefault(mount, []).append((subdir, cnt, size))
+
+        # Sort mounts by total size descending
+        mount_totals = [
+            (m, sum(s for _, _, s in dirs))
+            for m, dirs in mount_data.items()
+        ]
+        mount_totals.sort(key=lambda x: x[1], reverse=True)
+
+        w("| Path | Files | Size |")
+        w("|------|-------|------|")
+
+        for mount, _mt in mount_totals:
+            dirs = mount_data[mount]
+            dirs.sort(key=lambda x: x[2], reverse=True)
+            for subdir, cnt, size in dirs[:5]:
+                if size < 1024 * 1024:  # skip < 1 MB
+                    continue
+                full_path = (
+                    f"{mount.rstrip('/').rstrip(chr(92))}{chr(92)}{subdir}"
+                    if subdir != "." else mount
+                )
+                w(f"| `{full_path}` | {cnt:,} | {format_bytes(size)} |")
+        w("")
+
+    CP_FILE.write_text("\n".join(lines), encoding="utf-8")
 
 
 # ============================================================
@@ -1252,16 +1487,24 @@ def main() -> None:
     generate_software()
     print(f"  [OK] {SW_FILE}")
 
-    generate_disk_space()
+    scan_results = generate_disk_space()
     print(f"  [OK] {DS_FILE}")
 
+    generate_filestats(scan_results)
+    print(f"  [OK] {FS_FILE}")
+
+    generate_category_paths(scan_results)
+    print(f"  [OK] {CP_FILE}")
+
     print()
-    print("Done. 4 files generated:")
+    print("Done. 6 files generated:")
     for label, path in [
         ("Hardware", HW_FILE),
         ("Software", SW_FILE),
         ("State", ST_FILE),
         ("Disk Space", DS_FILE),
+        ("File Stats", FS_FILE),
+        ("Cat Paths", CP_FILE),
     ]:
         size = format_bytes(path.stat().st_size) if path.exists() else "?"
         print(f"  {label:10s}: {path} ({size})")
